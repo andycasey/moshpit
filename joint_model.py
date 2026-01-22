@@ -540,10 +540,6 @@ def fit_model_jit_joint(
     track_likelihood: bool = False
 ):
     """Fit model using joint least squares (all parameters updated simultaneously).
-
-    This is an alternative to the block-coordinate descent in fit_model_jit.
-    Instead of alternating between sky, amplitudes, and positions, this
-    solves for all parameter updates in a single large least squares problem.
     """
 
     # Pre-allocate array for log-likelihoods
@@ -997,7 +993,7 @@ if __name__ == '__main__':
 
     n_iter = 20
     # Create test data
-    n_pix_side = 100 # 4096
+    n_pix_side = 4096 # 4096
     n_stars = 256 # 25_600
 
     #n_pix_side, n_stars = (4096, 25_600)
@@ -1138,5 +1134,5 @@ if __name__ == '__main__':
         final_state=final_state_joint,
         image_shape=(n_pix_side, n_pix_side),
         log_likes=[float(ll) for ll in log_likes_joint],
-        prefix="joint"
+        prefix=f"joint_{n_pix_side}_{n_stars}"
     )

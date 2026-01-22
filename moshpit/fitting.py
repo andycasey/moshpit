@@ -24,7 +24,6 @@ def irls_step(
     state: ModelState,
     field_center: Float[Array, "2"],
     floor: float = 1.0,
-    fit_sky: bool = True,
     fit_psf: bool = False,
     damping: float = 0.5
 ) -> ModelState:
@@ -40,7 +39,6 @@ def irls_step(
         state: Current model state
         field_center: Field center for PSF deviations
         floor: Minimum allowed model value (prevents negative/zero)
-        fit_sky: Whether to update sky parameters
         fit_psf: Whether to update PSF parameters (not implemented)
         damping: Damping factor for parameter updates (0=no update, 1=full update)
 
@@ -66,11 +64,11 @@ def irls_step(
     )
 
     # Step 1: Update sky (solve for delta_sky)
-    def update_sky(_):
+    def update_sky():
         delta_sky = solve_weighted_lstsq(S, residual, weights, 1e-3)
         return state.sky_coeffs + damping * delta_sky
 
-    sky_coeffs = lax.cond(fit_sky, update_sky, lambda _: state.sky_coeffs, None)
+    sky_coeffs = update_sky()
 
     # Recompute model and residual with new sky
     sky_model = S @ sky_coeffs
@@ -116,85 +114,17 @@ def irls_step(
     )
 
 
-def fit_model_jit(
-    data: Float[Array, "n_pix"],
-    pixel_coords: Float[Array, "n_pix 2"],
-    initial_state: ModelState,
-    field_center: Float[Array, "2"],
-    n_iter: int = 30,
-    fit_sky: bool = True,
-    track_likelihood: bool = False
-):
-    """Fit model using JIT-compiled IRLS.
-
-    Args:
-        data: Observed pixel values (n_pix,)
-        pixel_coords: Pixel coordinates (n_pix, 2)
-        initial_state: Initial model state
-        field_center: Field center for PSF deviations
-        n_iter: Number of IRLS iterations
-        fit_sky: Whether to fit sky parameters
-        track_likelihood: If True, return (final_state, log_likes). Otherwise just final_state.
-
-    Returns:
-        If track_likelihood=False: final_state (ModelState)
-        If track_likelihood=True: (final_state, log_likes) tuple
-    """
-
-    # Always use lax.scan with log-likelihood array in carry
-    # Pre-allocate array for log-likelihoods (n_iter + 1 for initial + each iteration)
-    log_likes_array = jnp.zeros(n_iter + 1)
-
-    # Compute initial log-likelihood
-    init_model = eval_model(pixel_coords, initial_state, field_center)
-    init_ll = poisson_log_likelihood(data, init_model)
-    log_likes_array = log_likes_array.at[0].set(init_ll)
-
-    def body_fn(carry, i):
-        state, ll_array = carry
-
-        # Update state
-        new_state = irls_step(data, pixel_coords, state, field_center,
-                             fit_sky=fit_sky, fit_psf=False)
-
-        # Compute log-likelihood after update
-        model = eval_model(pixel_coords, new_state, field_center)
-        ll = poisson_log_likelihood(data, model)
-
-        # Store log-likelihood (i+1 because index 0 is initial)
-        ll_array = ll_array.at[i + 1].set(ll)
-
-        return (new_state, ll_array), None
-
-    # Run optimization with lax.scan
-    (final_state, log_likes_array), _ = lax.scan(
-        body_fn,
-        (initial_state, log_likes_array),
-        jnp.arange(n_iter)
-    )
-
-    if track_likelihood:
-        # Return JAX array directly
-        return final_state, log_likes_array
-    else:
-        return final_state
-
-
 def apply_parameter_update(
     state: ModelState,
     delta_sky: Float[Array, "6"],
     delta_amps: Float[Array, "n_stars"],
     delta_pos: Float[Array, "2*n_stars"],
     step_size: float,
-    fit_sky: bool
 ) -> ModelState:
     """Apply parameter updates with given step size."""
 
     # Update sky
-    if fit_sky:
-        sky_coeffs = state.sky_coeffs + step_size * delta_sky
-    else:
-        sky_coeffs = state.sky_coeffs
+    sky_coeffs = state.sky_coeffs + step_size * delta_sky
 
     # Update amplitudes
     amplitudes = state.amplitudes + step_size * delta_amps
@@ -223,7 +153,6 @@ def irls_step_joint_linesearch(
     state: ModelState,
     field_center: Float[Array, "2"],
     floor: float = 1.0,
-    fit_sky: bool = True,
     regularization: float = 1e-6
 ) -> ModelState:
     """One IRLS iteration with backtracking line search to ensure LL increases.
@@ -242,7 +171,7 @@ def irls_step_joint_linesearch(
     residual = data - current_model
 
     # Build all design matrices
-    S = build_design_matrix_sky(pixel_coords) if fit_sky else None
+    S = build_design_matrix_sky(pixel_coords)
     M = build_design_matrix_amplitudes(
         pixel_coords, state.positions,
         state.psf_sigmas, state.psf_ref_weights,
@@ -257,25 +186,16 @@ def irls_step_joint_linesearch(
     )
 
     # Concatenate design matrices
-    design_matrices = []
-    if fit_sky and S is not None:
-        design_matrices.append(S)
-    design_matrices.append(M)
-    design_matrices.append(G)
-
-    X = jnp.concatenate(design_matrices, axis=1)
+    X = jnp.concatenate([S, M, G], axis=1)
 
     # Solve joint least squares
     delta = solve_weighted_lstsq(X, residual, weights, regularization)
 
     # Extract individual parameter updates
     idx = 0
-    if fit_sky and S is not None:
-        n_sky = S.shape[1]
-        delta_sky = delta[idx:idx + n_sky]
-        idx += n_sky
-    else:
-        delta_sky = jnp.zeros(6)
+    n_sky = S.shape[1]
+    delta_sky = delta[idx:idx + n_sky]
+    idx += n_sky
 
     n_amps = M.shape[1]
     delta_amps = delta[idx:idx + n_amps]
@@ -289,7 +209,7 @@ def irls_step_joint_linesearch(
 
     def try_step(step_size):
         candidate_state = apply_parameter_update(
-            state, delta_sky, delta_amps, delta_pos, step_size, fit_sky
+            state, delta_sky, delta_amps, delta_pos, step_size
         )
         candidate_model = eval_model(pixel_coords, candidate_state, field_center)
         candidate_model = jnp.maximum(candidate_model, floor)
@@ -450,93 +370,19 @@ def irls_step_joint(
     )
 
 
-@partial(jit, static_argnums=(4, 5, 6))
-def fit_model_jit_joint(
+@partial(jit, static_argnums=(4, 5))
+def fit_model(
     data: Float[Array, "n_pix"],
     pixel_coords: Float[Array, "n_pix 2"],
     initial_state: ModelState,
     field_center: Float[Array, "2"],
     n_iter: int = 30,
-    fit_sky: bool = True,
-    track_likelihood: bool = False
-):
-    """Fit model using joint least squares (all parameters updated simultaneously).
-
-    This is an alternative to the block-coordinate descent in fit_model_jit.
-    Instead of alternating between sky, amplitudes, and positions, this
-    solves for all parameter updates in a single large least squares problem.
-
-    Args:
-        data: Observed pixel values (n_pix,)
-        pixel_coords: Pixel coordinates (n_pix, 2)
-        initial_state: Initial model state
-        field_center: Field center for PSF deviations
-        n_iter: Number of iterations
-        fit_sky: Whether to fit sky parameters
-        track_likelihood: If True, return (final_state, log_likes)
-
-    Returns:
-        If track_likelihood=False: final_state (ModelState)
-        If track_likelihood=True: (final_state, log_likes) tuple
-    """
-
-    # Pre-allocate array for log-likelihoods
-    log_likes_array = jnp.zeros(n_iter + 1)
-
-    # Compute initial log-likelihood
-    init_model = eval_model(pixel_coords, initial_state, field_center)
-    init_ll = poisson_log_likelihood(data, init_model)
-    log_likes_array = log_likes_array.at[0].set(init_ll)
-
-    def body_fn(carry, i):
-        state, ll_array = carry
-
-        # Update all parameters jointly
-        new_state = irls_step_joint(
-            data, pixel_coords, state, field_center,
-            fit_sky=fit_sky,
-            fit_amplitudes=True,
-            fit_positions=True
-        )
-
-        # Compute log-likelihood after update
-        model = eval_model(pixel_coords, new_state, field_center)
-        ll = poisson_log_likelihood(data, model)
-
-        # Store log-likelihood
-        ll_array = ll_array.at[i + 1].set(ll)
-
-        return (new_state, ll_array), None
-
-    # Run optimization with lax.scan
-    (final_state, log_likes_array), _ = lax.scan(
-        body_fn,
-        (initial_state, log_likes_array),
-        jnp.arange(n_iter)
-    )
-
-    if track_likelihood:
-        # Return JAX array directly
-        return final_state, log_likes_array
-    else:
-        return final_state
-
-
-@partial(jit, static_argnums=(4, 5, 6))
-def fit_model_jit_joint_linesearch(
-    data: Float[Array, "n_pix"],
-    pixel_coords: Float[Array, "n_pix 2"],
-    initial_state: ModelState,
-    field_center: Float[Array, "2"],
-    n_iter: int = 30,
-    fit_sky: bool = True,
-    track_likelihood: bool = False
 ):
     """Fit model using joint least squares with line search.
 
     This version uses backtracking line search to guarantee monotonic
     increase in log-likelihood, fixing the oscillation problem in
-    fit_model_jit_joint.
+    fit_model.
 
     Args:
         data: Observed pixel values (n_pix,)
@@ -544,7 +390,6 @@ def fit_model_jit_joint_linesearch(
         initial_state: Initial model state
         field_center: Field center for PSF deviations
         n_iter: Number of iterations
-        fit_sky: Whether to fit sky parameters
         track_likelihood: If True, return (final_state, log_likes)
 
     Returns:
@@ -566,7 +411,6 @@ def fit_model_jit_joint_linesearch(
         # Update all parameters jointly with line search
         new_state = irls_step_joint_linesearch(
             data, pixel_coords, state, field_center,
-            fit_sky=fit_sky
         )
 
         # Compute log-likelihood after update
@@ -585,8 +429,4 @@ def fit_model_jit_joint_linesearch(
         jnp.arange(n_iter)
     )
 
-    if track_likelihood:
-        # Return JAX array directly
-        return final_state, log_likes_array
-    else:
-        return final_state
+    return final_state, log_likes_array
